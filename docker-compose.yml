@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  lovense-mcp:
+    build: .
+    container_name: lovense-mcp-server
+    ports:
+      - "8000:8000"
+    environment:
+      # Lovense Remote Game Mode Configuration
+      GAME_MODE_IP: "${GAME_MODE_IP}"
+      GAME_MODE_PORT: "${GAME_MODE_PORT:-30010}"
+      
+      # Authentication Token (Bearer)
+      AUTH_TOKEN: "${AUTH_TOKEN}"
+      
+      # Server Port (optional)
+      PORT: "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - lovense-network
+
+networks:
+  lovense-network:
+    driver: bridge
