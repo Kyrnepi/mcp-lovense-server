@@ -10,10 +10,10 @@ services:
       # Lovense Remote Game Mode Configuration
       GAME_MODE_IP: "${GAME_MODE_IP}"
       GAME_MODE_PORT: "${GAME_MODE_PORT:-30010}"
-      
-      # Authentication Token (Bearer)
-      AUTH_TOKEN: "${AUTH_TOKEN}"
-      
+
+      # MCP Authentication Token (Bearer)
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
+
       # Server Port (optional)
       PORT: "8000"
     restart: unless-stopped
