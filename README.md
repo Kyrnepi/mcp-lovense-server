@@ -14,8 +14,8 @@
 ### ✨ Key Features
 
 **MCP Compliance:**
-- ✅ MCP Python SDK implementation
-- ✅ Stdio transport (standard MCP communication)
+- ✅ HTTP transport with FastAPI
+- ✅ StreamingResponse for efficient data transfer
 - ✅ Full protocol support: tools, resources, and prompts
 - ✅ JSON-RPC 2.0 compliant
 
@@ -63,6 +63,8 @@ nano .env  # Edit with your settings
 ```env
 GAME_MODE_IP=192.168.1.100    # Your Lovense Remote local IP
 GAME_MODE_PORT=30010          # HTTPS port (default: 30010)
+MCP_AUTH_TOKEN=your-secret-token-here  # Authentication token for MCP endpoint
+PORT=8000                     # HTTP server port (default: 8000)
 ```
 
 #### 3. Get Game Mode IP Address
@@ -89,44 +91,34 @@ docker-compose down
 
 ### 🔧 Usage
 
-This is an MCP server that communicates via **stdio** (standard input/output). It's designed to be used with MCP clients like Claude Desktop, or any application that supports the MCP protocol.
+This is an MCP server that communicates via **HTTP** using FastAPI. It exposes a `/mcp` endpoint that accepts JSON-RPC 2.0 requests and returns streaming responses.
 
-#### Connecting to Claude Desktop
+#### API Endpoints
 
-Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
+- **POST `/mcp`**: Main MCP endpoint (requires Bearer token authentication)
+- **GET `/health`**: Health check endpoint (no authentication required)
 
-```json
-{
-  "mcpServers": {
-    "lovense": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-e",
-        "GAME_MODE_IP=192.168.1.100",
-        "-e",
-        "GAME_MODE_PORT=30010",
-        "lovense-mcp-server"
-      ]
-    }
-  }
-}
+#### Authentication
+
+All requests to `/mcp` must include a Bearer token in the Authorization header:
+
+```bash
+curl -X POST http://localhost:8000/mcp \
+  -H "Authorization: Bearer your-secret-token-here" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 ```
 
-Or if running locally without Docker:
+#### Connecting to MCP Clients
+
+Configure your MCP client to connect to the HTTP endpoint:
 
 ```json
 {
-  "mcpServers": {
-    "lovense": {
-      "command": "python",
-      "args": ["server.py"],
-      "env": {
-        "GAME_MODE_IP": "192.168.1.100",
-        "GAME_MODE_PORT": "30010"
-      }
+  "lovense": {
+    "url": "http://localhost:8000/mcp",
+    "headers": {
+      "Authorization": "Bearer your-secret-token-here"
     }
   }
 }
@@ -325,8 +317,8 @@ Serveur **Model Context Protocol (MCP)** pour contrôler les jouets Lovense via 
 ### ✨ Fonctionnalités clés
 
 **Conformité MCP:**
-- ✅ Implémentation du SDK Python MCP
-- ✅ Transport stdio (communication MCP standard)
+- ✅ Transport HTTP avec FastAPI
+- ✅ StreamingResponse pour un transfert de données efficace
 - ✅ Support complet du protocole : outils, ressources et prompts
 - ✅ Conforme à JSON-RPC 2.0
 
@@ -374,6 +366,8 @@ nano .env  # Modifier avec vos paramètres
 ```env
 GAME_MODE_IP=192.168.1.100    # Votre IP locale Lovense Remote
 GAME_MODE_PORT=30010          # Port HTTPS (défaut: 30010)
+MCP_AUTH_TOKEN=votre-token-secret-ici  # Token d'authentification pour l'endpoint MCP
+PORT=8000                     # Port du serveur HTTP (défaut: 8000)
 ```
 
 #### 3. Obtenir l'adresse IP du mode Game Mode
@@ -400,44 +394,34 @@ docker-compose down
 
 ### 🔧 Utilisation
 
-Ceci est un serveur MCP qui communique via **stdio** (entrée/sortie standard). Il est conçu pour être utilisé avec des clients MCP comme Claude Desktop, ou toute application supportant le protocole MCP.
+Ceci est un serveur MCP qui communique via **HTTP** en utilisant FastAPI. Il expose un endpoint `/mcp` qui accepte les requêtes JSON-RPC 2.0 et retourne des réponses en streaming.
 
-#### Connexion à Claude Desktop
+#### Endpoints API
 
-Ajoutez ceci à votre configuration Claude Desktop (`claude_desktop_config.json`):
+- **POST `/mcp`**: Endpoint MCP principal (requiert authentification Bearer token)
+- **GET `/health`**: Endpoint de santé (aucune authentification requise)
 
-```json
-{
-  "mcpServers": {
-    "lovense": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-e",
-        "GAME_MODE_IP=192.168.1.100",
-        "-e",
-        "GAME_MODE_PORT=30010",
-        "lovense-mcp-server"
-      ]
-    }
-  }
-}
+#### Authentification
+
+Toutes les requêtes vers `/mcp` doivent inclure un Bearer token dans l'en-tête Authorization:
+
+```bash
+curl -X POST http://localhost:8000/mcp \
+  -H "Authorization: Bearer votre-token-secret-ici" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 ```
 
-Ou si vous exécutez localement sans Docker:
+#### Connexion aux clients MCP
+
+Configurez votre client MCP pour se connecter à l'endpoint HTTP:
 
 ```json
 {
-  "mcpServers": {
-    "lovense": {
-      "command": "python",
-      "args": ["server.py"],
-      "env": {
-        "GAME_MODE_IP": "192.168.1.100",
-        "GAME_MODE_PORT": "30010"
-      }
+  "lovense": {
+    "url": "http://localhost:8000/mcp",
+    "headers": {
+      "Authorization": "Bearer votre-token-secret-ici"
     }
   }
 }

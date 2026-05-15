@@ -1,26 +1,42 @@
 """
 Lovense MCP Server
-MCP-compliant HTTP server for controlling Lovense toys via Game Mode
+MCP-compliant server for controlling Lovense toys via Game Mode.
+
+Supports both stdio and Streamable HTTP transports as defined by the
+MCP specification (2025-11-25).
 """
 
-import asyncio
+import hmac
 import json
 import logging
 import os
 import re
-from contextlib import asynccontextmanager
-from typing import Any, Optional
+import warnings
+from typing import Annotated, Any, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("lovense-mcp-server")
+
+# Lovense uses self-signed certificates – suppress the per-request warning
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+
+# ---------------------------------------------------------------------------
+# Lovense API layer
+# ---------------------------------------------------------------------------
 
 
 class LovenseConfig:
@@ -34,29 +50,23 @@ class LovenseConfig:
         if not self.game_mode_ip:
             raise ValueError("GAME_MODE_IP environment variable is required")
 
-        if not self.auth_token:
-            raise ValueError("MCP_AUTH_TOKEN environment variable is required")
-
         self.domain_url = self._convert_ip_to_domain()
         logger.info(f"Lovense API configured: {self.domain_url}")
-        logger.info("Authentication enabled")
+        if self.auth_token:
+            logger.info("Authentication enabled")
 
     def _convert_ip_to_domain(self) -> str:
         """Convert local IP to Lovense domain format"""
         ip = self.game_mode_ip.strip()
 
-        # Validate IP format
         if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip):
             raise ValueError(f"Invalid IP format: {ip}")
 
-        # Validate IP range
-        for part in ip.split('.'):
+        for part in ip.split("."):
             if not 0 <= int(part) <= 255:
                 raise ValueError(f"Invalid IP range: {ip}")
 
-        # Convert to Lovense domain format
-        domain = f"https://{ip.replace('.', '-')}.lovense.club:{self.game_mode_port}"
-        return domain
+        return f"https://{ip.replace('.', '-')}.lovense.club:{self.game_mode_port}"
 
 
 class LovenseAPIClient:
@@ -67,29 +77,27 @@ class LovenseAPIClient:
         self.http_client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
-        """Setup async HTTP client"""
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(10.0),
-            verify=False  # Lovense uses self-signed certificates
+            verify=False,  # Lovense uses self-signed certificates
         )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Cleanup async HTTP client"""
         if self.http_client:
             await self.http_client.aclose()
 
-    async def send_command(self, command: str, action: str, time_sec: int, toy: str = "") -> dict[str, Any]:
-        """Send command to Lovense API"""
+    async def send_command(
+        self, command: str, action: str, time_sec: int, toy: str = ""
+    ) -> dict[str, Any]:
         url = f"{self.config.domain_url}/command"
         data = {
             "command": command,
             "action": action,
             "timeSec": time_sec,
             "toy": toy,
-            "apiVer": 1
+            "apiVer": 1,
         }
-
         try:
             response = await self.http_client.post(url, json=data)
             response.raise_for_status()
@@ -97,654 +105,455 @@ class LovenseAPIClient:
             logger.info(f"Command sent successfully: {command} - {action}")
             return {"success": True, "data": result}
         except httpx.HTTPError as e:
-            logger.error(f"HTTP error: {str(e)}")
+            logger.error(f"HTTP error: {e}")
             return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+            logger.error(f"Unexpected error: {e}")
             return {"success": False, "error": str(e)}
 
-    async def vibrate(self, intensity: int, duration: int, toy: str = "") -> dict[str, Any]:
-        """Send vibration command"""
+    async def vibrate(
+        self, intensity: int, duration: int, toy: str = ""
+    ) -> dict[str, Any]:
         if not 0 <= intensity <= 20:
             return {"success": False, "error": "Intensity must be between 0 and 20"}
         if not 1 <= duration <= 60:
-            return {"success": False, "error": "Duration must be between 1 and 60 seconds"}
+            return {
+                "success": False,
+                "error": "Duration must be between 1 and 60 seconds",
+            }
         return await self.send_command("Function", f"Vibrate:{intensity}", duration, toy)
 
-    async def rotate(self, intensity: int, duration: int, toy: str = "") -> dict[str, Any]:
-        """Send rotation command"""
+    async def rotate(
+        self, intensity: int, duration: int, toy: str = ""
+    ) -> dict[str, Any]:
         if not 0 <= intensity <= 20:
             return {"success": False, "error": "Intensity must be between 0 and 20"}
         if not 1 <= duration <= 60:
-            return {"success": False, "error": "Duration must be between 1 and 60 seconds"}
+            return {
+                "success": False,
+                "error": "Duration must be between 1 and 60 seconds",
+            }
         return await self.send_command("Function", f"Rotate:{intensity}", duration, toy)
 
-    async def pump(self, intensity: int, duration: int, toy: str = "") -> dict[str, Any]:
-        """Send pump command"""
+    async def pump(
+        self, intensity: int, duration: int, toy: str = ""
+    ) -> dict[str, Any]:
         if not 0 <= intensity <= 3:
             return {"success": False, "error": "Intensity must be between 0 and 3"}
         if not 1 <= duration <= 60:
-            return {"success": False, "error": "Duration must be between 1 and 60 seconds"}
+            return {
+                "success": False,
+                "error": "Duration must be between 1 and 60 seconds",
+            }
         return await self.send_command("Function", f"Pump:{intensity}", duration, toy)
 
     async def stop(self, toy: str = "") -> dict[str, Any]:
-        """Stop all toy functions"""
         return await self.send_command("Function", "Stop", 0, toy)
 
     async def get_toys(self) -> dict[str, Any]:
-        """Get list of connected toys"""
         url = f"{self.config.domain_url}/GetToys"
         try:
             response = await self.http_client.get(url)
             response.raise_for_status()
-            result = response.json()
-            return {"success": True, "data": result}
+            return {"success": True, "data": response.json()}
         except Exception as e:
-            logger.error(f"Failed to get toys: {str(e)}")
+            logger.error(f"Failed to get toys: {e}")
             return {"success": False, "error": str(e)}
 
 
-# Global state
+# ---------------------------------------------------------------------------
+# Global state – initialised at startup
+# ---------------------------------------------------------------------------
+
 config: Optional[LovenseConfig] = None
 api_client: Optional[LovenseAPIClient] = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize and cleanup resources"""
-    global config, api_client
-
-    # Startup
-    try:
-        config = LovenseConfig()
-        api_client = LovenseAPIClient(config)
-        await api_client.__aenter__()
-        logger.info("Server started successfully")
-    except Exception as e:
-        logger.error(f"Startup error: {str(e)}")
-        raise
-
-    yield
-
-    # Shutdown
-    if api_client:
-        await api_client.__aexit__(None, None, None)
-    logger.info("Server shutting down")
+def _require_client() -> LovenseAPIClient:
+    """Return the initialised API client or raise a clear error."""
+    if api_client is None or api_client.http_client is None:
+        raise RuntimeError(
+            "Lovense API client is not initialised. "
+            "Make sure GAME_MODE_IP is set and the server was started correctly."
+        )
+    return api_client
 
 
-# Create FastAPI app
-app = FastAPI(title="Lovense MCP Server", lifespan=lifespan)
+# ---------------------------------------------------------------------------
+# MCP Server (FastMCP) – protocol version 2025-11-25
+# ---------------------------------------------------------------------------
+
+# Build the list of allowed hosts for DNS-rebinding protection.
+# Always allow localhost; add the external hostname if configured.
+_allowed_hosts = ["localhost", "127.0.0.1"]
+_external_host = os.getenv("EXTERNAL_HOST", "")
+if _external_host:
+    _allowed_hosts.append(_external_host)
+
+mcp = FastMCP(
+    "lovense-mcp-server",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+    ),
+)
 
 
-async def verify_token(authorization: Optional[str] = Header(None)) -> bool:
-    """Verify Bearer token - accepts both 'Bearer <token>' and '<token>' formats"""
-    if not authorization:
-        logger.warning("Missing Authorization header")
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    # Extract token - handle both "Bearer token" and "token" formats
-    token = authorization
-    if authorization.startswith("Bearer "):
-        token = authorization[7:]  # Remove "Bearer " prefix
-
-    if token != config.auth_token:
-        logger.warning("Invalid authentication token provided")
-        raise HTTPException(status_code=403, detail="Invalid authentication token")
-
-    return True
+# ---- Tools ----------------------------------------------------------------
 
 
-def handle_initialize(request_id: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Handle MCP initialize request"""
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {}
-            },
-            "serverInfo": {
-                "name": "lovense-mcp-server",
-                "version": "2.0.0"
-            }
-        }
-    }
-
-
-def handle_tools_list(request_id: str) -> dict[str, Any]:
-    """Handle MCP tools/list request"""
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "tools": [
-                {
-                    "name": "vibrate",
-                    "description": "Send vibration command to Lovense toy. Controls vibration intensity and duration.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "toy": {
-                                "type": "string",
-                                "description": "Toy ID to control (empty string for all connected toys)",
-                                "default": ""
-                            },
-                            "intensity": {
-                                "type": "integer",
-                                "description": "Vibration intensity level (0-20, where 0 is off and 20 is maximum)",
-                                "minimum": 0,
-                                "maximum": 20,
-                                "default": 10
-                            },
-                            "duration": {
-                                "type": "integer",
-                                "description": "Duration in seconds (1-60)",
-                                "minimum": 1,
-                                "maximum": 60,
-                                "default": 5
-                            }
-                        },
-                        "required": ["intensity", "duration"]
-                    }
-                },
-                {
-                    "name": "rotate",
-                    "description": "Send rotation command to Lovense toy with rotation capability. Controls rotation speed and duration.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "toy": {
-                                "type": "string",
-                                "description": "Toy ID to control (empty string for all connected toys)",
-                                "default": ""
-                            },
-                            "intensity": {
-                                "type": "integer",
-                                "description": "Rotation intensity level (0-20)",
-                                "minimum": 0,
-                                "maximum": 20,
-                                "default": 10
-                            },
-                            "duration": {
-                                "type": "integer",
-                                "description": "Duration in seconds (1-60)",
-                                "minimum": 1,
-                                "maximum": 60,
-                                "default": 5
-                            }
-                        },
-                        "required": ["intensity", "duration"]
-                    }
-                },
-                {
-                    "name": "pump",
-                    "description": "Send pump command to Lovense toy with pump capability. Controls pump intensity and duration.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "toy": {
-                                "type": "string",
-                                "description": "Toy ID to control (empty string for all connected toys)",
-                                "default": ""
-                            },
-                            "intensity": {
-                                "type": "integer",
-                                "description": "Pump intensity level (0-3)",
-                                "minimum": 0,
-                                "maximum": 3,
-                                "default": 2
-                            },
-                            "duration": {
-                                "type": "integer",
-                                "description": "Duration in seconds (1-60)",
-                                "minimum": 1,
-                                "maximum": 60,
-                                "default": 5
-                            }
-                        },
-                        "required": ["intensity", "duration"]
-                    }
-                },
-                {
-                    "name": "stop",
-                    "description": "Immediately stop all running functions on Lovense toy(s). Emergency stop command.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "toy": {
-                                "type": "string",
-                                "description": "Toy ID to stop (empty string for all connected toys)",
-                                "default": ""
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "pattern",
-                    "description": "Send a preset vibration pattern to Lovense toy. Use predefined patterns for varied experiences.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "toy": {
-                                "type": "string",
-                                "description": "Toy ID to control (empty string for all connected toys)",
-                                "default": ""
-                            },
-                            "pattern": {
-                                "type": "string",
-                                "description": "Pattern name: 'pulse' (rhythmic pulses), 'wave' (gradual waves), 'fireworks' (random bursts), 'earthquake' (intense vibrations)",
-                                "enum": ["pulse", "wave", "fireworks", "earthquake"],
-                                "default": "pulse"
-                            },
-                            "duration": {
-                                "type": "integer",
-                                "description": "Duration in seconds (1-60)",
-                                "minimum": 1,
-                                "maximum": 60,
-                                "default": 10
-                            }
-                        },
-                        "required": ["pattern", "duration"]
-                    }
-                }
-            ]
-        }
-    }
-
-
-async def handle_tools_call(request_id: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Handle MCP tools/call request"""
-    tool_name = params.get("name")
-    arguments = params.get("arguments", {})
-
-    try:
-        if tool_name == "vibrate":
-            result = await api_client.vibrate(
-                intensity=arguments.get("intensity", 10),
-                duration=arguments.get("duration", 5),
-                toy=arguments.get("toy", "")
-            )
-        elif tool_name == "rotate":
-            result = await api_client.rotate(
-                intensity=arguments.get("intensity", 10),
-                duration=arguments.get("duration", 5),
-                toy=arguments.get("toy", "")
-            )
-        elif tool_name == "pump":
-            result = await api_client.pump(
-                intensity=arguments.get("intensity", 2),
-                duration=arguments.get("duration", 5),
-                toy=arguments.get("toy", "")
-            )
-        elif tool_name == "stop":
-            result = await api_client.stop(toy=arguments.get("toy", ""))
-        elif tool_name == "pattern":
-            pattern_map = {
-                "pulse": "Preset:1",
-                "wave": "Preset:2",
-                "fireworks": "Preset:3",
-                "earthquake": "Preset:4"
-            }
-            pattern = arguments.get("pattern", "pulse")
-            action = pattern_map.get(pattern, "Preset:1")
-            result = await api_client.send_command(
-                "Function", action,
-                arguments.get("duration", 10),
-                arguments.get("toy", "")
-            )
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Unknown tool: {tool_name}"
-                }
-            }
-
-        if result["success"]:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Success: Command '{tool_name}' executed. Response: {result.get('data', {})}"
-                        }
-                    ]
-                }
-            }
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32000,
-                    "message": f"Failed to execute '{tool_name}': {result.get('error', 'Unknown error')}"
-                }
-            }
-
-    except Exception as e:
-        logger.error(f"Tool execution error: {str(e)}")
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32000,
-                "message": f"Execution error: {str(e)}"
-            }
-        }
-
-
-def handle_resources_list(request_id: str) -> dict[str, Any]:
-    """Handle MCP resources/list request"""
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "resources": [
-                {
-                    "uri": "lovense://toys/connected",
-                    "name": "Connected Toys",
-                    "description": "List of currently connected Lovense toys and their status",
-                    "mimeType": "application/json"
-                },
-                {
-                    "uri": "lovense://config/api",
-                    "name": "API Configuration",
-                    "description": "Current Lovense API configuration and connection details",
-                    "mimeType": "application/json"
-                }
-            ]
-        }
-    }
-
-
-async def handle_resources_read(request_id: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Handle MCP resources/read request"""
-    uri = params.get("uri")
-
-    try:
-        if uri == "lovense://toys/connected":
-            result = await api_client.get_toys()
-            if result["success"]:
-                content = json.dumps(result["data"], indent=2)
-            else:
-                content = json.dumps({"error": result.get("error", "Failed to get toys")}, indent=2)
-
-        elif uri == "lovense://config/api":
-            config_info = {
-                "domain_url": config.domain_url,
-                "game_mode_ip": config.game_mode_ip,
-                "game_mode_port": config.game_mode_port,
-                "status": "connected"
-            }
-            content = json.dumps(config_info, indent=2)
-
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32602,
-                    "message": f"Unknown resource URI: {uri}"
-                }
-            }
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "contents": [
-                    {
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": content
-                    }
-                ]
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"Resource read error: {str(e)}")
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32000,
-                "message": f"Failed to read resource: {str(e)}"
-            }
-        }
-
-
-def handle_prompts_list(request_id: str) -> dict[str, Any]:
-    """Handle MCP prompts/list request"""
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "prompts": [
-                {
-                    "name": "control_toy",
-                    "description": "Interactive prompt for controlling Lovense toys with guided parameters",
-                    "arguments": [
-                        {
-                            "name": "action",
-                            "description": "Action to perform: vibrate, rotate, pump, stop, or pattern",
-                            "required": True
-                        },
-                        {
-                            "name": "intensity",
-                            "description": "Intensity level (0-20 for most actions, 0-3 for pump)",
-                            "required": False
-                        },
-                        {
-                            "name": "duration",
-                            "description": "Duration in seconds (1-60)",
-                            "required": False
-                        }
-                    ]
-                },
-                {
-                    "name": "quick_vibrate",
-                    "description": "Quick vibration with preset intensity and duration",
-                    "arguments": [
-                        {
-                            "name": "level",
-                            "description": "Intensity level: low, medium, or high",
-                            "required": True
-                        }
-                    ]
-                },
-                {
-                    "name": "pattern_play",
-                    "description": "Play a vibration pattern with specified duration",
-                    "arguments": [
-                        {
-                            "name": "pattern_name",
-                            "description": "Pattern: pulse, wave, fireworks, or earthquake",
-                            "required": True
-                        },
-                        {
-                            "name": "duration",
-                            "description": "Duration in seconds",
-                            "required": False
-                        }
-                    ]
-                }
-            ]
-        }
-    }
-
-
-def handle_prompts_get(request_id: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Handle MCP prompts/get request"""
-    prompt_name = params.get("name")
-    arguments = params.get("arguments", {})
-
-    if prompt_name == "control_toy":
-        action = arguments.get("action", "vibrate")
-        intensity = arguments.get("intensity", "10")
-        duration = arguments.get("duration", "5")
-
-        message = f"""I want to control the Lovense toy with the following parameters:
-
-Action: {action}
-Intensity: {intensity}
-Duration: {duration} seconds
-
-Please execute this command using the appropriate tool."""
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "description": f"Control Lovense toy: {action}",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": message
-                        }
-                    }
-                ]
-            }
-        }
-
-    elif prompt_name == "quick_vibrate":
-        level = arguments.get("level", "medium")
-        intensity_map = {"low": 5, "medium": 10, "high": 18}
-        intensity = intensity_map.get(level, 10)
-
-        message = f"Please send a quick vibration command with {level} intensity (level {intensity}) for 3 seconds."
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "description": f"Quick vibrate: {level}",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": message
-                        }
-                    }
-                ]
-            }
-        }
-
-    elif prompt_name == "pattern_play":
-        pattern = arguments.get("pattern_name", "pulse")
-        duration = arguments.get("duration", "10")
-
-        message = f"Please play the '{pattern}' vibration pattern for {duration} seconds."
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "description": f"Pattern: {pattern}",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": message
-                        }
-                    }
-                ]
-            }
-        }
-
-    else:
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32602,
-                "message": f"Unknown prompt: {prompt_name}"
-            }
-        }
-
-
-@app.post("/mcp")
-async def mcp_endpoint(
-    request: Request,
-    authorization: Optional[str] = Header(None, alias="Authorization")
-):
-    """Main MCP endpoint with streaming support"""
-    await verify_token(authorization)
-
-    try:
-        body = await request.json()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-
-    # Handle JSON-RPC request
-    method = body.get("method")
-    request_id = body.get("id")
-    params = body.get("params", {})
-
-    logger.info(f"Received MCP request: method={method}, id={request_id}")
-
-    # Route to appropriate handler
-    if method == "initialize":
-        response = handle_initialize(request_id, params)
-    elif method == "tools/list":
-        response = handle_tools_list(request_id)
-    elif method == "tools/call":
-        response = await handle_tools_call(request_id, params)
-    elif method == "resources/list":
-        response = handle_resources_list(request_id)
-    elif method == "resources/read":
-        response = await handle_resources_read(request_id, params)
-    elif method == "prompts/list":
-        response = handle_prompts_list(request_id)
-    elif method == "prompts/get":
-        response = handle_prompts_get(request_id, params)
-    else:
-        response = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32601,
-                "message": f"Method not found: {method}"
-            }
-        }
-
-    # Stream response
-    async def generate():
-        yield json.dumps(response).encode('utf-8')
-
-    return StreamingResponse(
-        generate(),
-        media_type="application/json",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Content-Type-Options": "nosniff"
-        }
+def _check_result(result: dict[str, Any], tool_name: str) -> str:
+    """Return success text or raise on failure (-> isError=true in MCP)."""
+    if result["success"]:
+        return (
+            f"Success: Command '{tool_name}' executed. "
+            f"Response: {result.get('data', {})}"
+        )
+    raise Exception(
+        f"Failed to execute '{tool_name}': {result.get('error', 'Unknown error')}"
     )
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "server": "lovense-mcp-server",
-        "version": "2.0.0",
-        "domain_configured": bool(config and config.domain_url)
-    }
+@mcp.tool(
+    description=(
+        "Send vibration command to Lovense toy. "
+        "Controls vibration intensity and duration."
+    )
+)
+async def vibrate(
+    intensity: Annotated[
+        int,
+        Field(
+            description="Vibration intensity level (0-20, where 0 is off and 20 is maximum)",
+            ge=0,
+            le=20,
+        ),
+    ] = 10,
+    duration: Annotated[
+        int,
+        Field(description="Duration in seconds (1-60)", ge=1, le=60),
+    ] = 5,
+    toy: Annotated[
+        str,
+        Field(description="Toy ID to control (empty string for all connected toys)"),
+    ] = "",
+) -> str:
+    client = _require_client()
+    result = await client.vibrate(intensity, duration, toy)
+    return _check_result(result, "vibrate")
 
+
+@mcp.tool(
+    description=(
+        "Send rotation command to Lovense toy with rotation capability. "
+        "Controls rotation speed and duration."
+    )
+)
+async def rotate(
+    intensity: Annotated[
+        int,
+        Field(description="Rotation intensity level (0-20)", ge=0, le=20),
+    ] = 10,
+    duration: Annotated[
+        int,
+        Field(description="Duration in seconds (1-60)", ge=1, le=60),
+    ] = 5,
+    toy: Annotated[
+        str,
+        Field(description="Toy ID to control (empty string for all connected toys)"),
+    ] = "",
+) -> str:
+    client = _require_client()
+    result = await client.rotate(intensity, duration, toy)
+    return _check_result(result, "rotate")
+
+
+@mcp.tool(
+    description=(
+        "Send pump command to Lovense toy with pump capability. "
+        "Controls pump intensity and duration."
+    )
+)
+async def pump(
+    intensity: Annotated[
+        int,
+        Field(description="Pump intensity level (0-3)", ge=0, le=3),
+    ] = 2,
+    duration: Annotated[
+        int,
+        Field(description="Duration in seconds (1-60)", ge=1, le=60),
+    ] = 5,
+    toy: Annotated[
+        str,
+        Field(description="Toy ID to control (empty string for all connected toys)"),
+    ] = "",
+) -> str:
+    client = _require_client()
+    result = await client.pump(intensity, duration, toy)
+    return _check_result(result, "pump")
+
+
+@mcp.tool(
+    description=(
+        "Immediately stop all running functions on Lovense toy(s). "
+        "Emergency stop command."
+    )
+)
+async def stop(
+    toy: Annotated[
+        str,
+        Field(description="Toy ID to stop (empty string for all connected toys)"),
+    ] = "",
+) -> str:
+    client = _require_client()
+    result = await client.stop(toy)
+    return _check_result(result, "stop")
+
+
+PATTERN_MAP = {
+    "pulse": "Preset:1",
+    "wave": "Preset:2",
+    "fireworks": "Preset:3",
+    "earthquake": "Preset:4",
+}
+
+
+@mcp.tool(
+    description=(
+        "Send a preset vibration pattern to Lovense toy. "
+        "Use predefined patterns for varied experiences."
+    )
+)
+async def pattern(
+    pattern_name: Annotated[
+        Literal["pulse", "wave", "fireworks", "earthquake"],
+        Field(
+            description=(
+                "Pattern name: 'pulse' (rhythmic pulses), 'wave' (gradual waves), "
+                "'fireworks' (random bursts), 'earthquake' (intense vibrations)"
+            ),
+        ),
+    ] = "pulse",
+    duration: Annotated[
+        int,
+        Field(description="Duration in seconds (1-60)", ge=1, le=60),
+    ] = 10,
+    toy: Annotated[
+        str,
+        Field(description="Toy ID to control (empty string for all connected toys)"),
+    ] = "",
+) -> str:
+    client = _require_client()
+    action = PATTERN_MAP[pattern_name]
+    result = await client.send_command("Function", action, duration, toy)
+    return _check_result(result, f"pattern({pattern_name})")
+
+
+# ---- Resources ------------------------------------------------------------
+
+
+@mcp.resource(
+    "lovense://toys/connected",
+    name="Connected Toys",
+    description="List of currently connected Lovense toys and their status",
+    mime_type="application/json",
+)
+async def connected_toys() -> str:
+    client = _require_client()
+    result = await client.get_toys()
+    if result["success"]:
+        return json.dumps(result["data"], indent=2)
+    return json.dumps(
+        {"error": result.get("error", "Failed to get toys")}, indent=2
+    )
+
+
+@mcp.resource(
+    "lovense://config/api",
+    name="API Configuration",
+    description="Current Lovense API configuration and connection details",
+    mime_type="application/json",
+)
+async def api_configuration() -> str:
+    if config is None:
+        return json.dumps({"error": "Server not configured"}, indent=2)
+    return json.dumps(
+        {
+            "domain_url": config.domain_url,
+            "game_mode_ip": config.game_mode_ip,
+            "game_mode_port": config.game_mode_port,
+            "status": "connected",
+        },
+        indent=2,
+    )
+
+
+# ---- Prompts --------------------------------------------------------------
+
+
+@mcp.prompt(
+    description="Interactive prompt for controlling Lovense toys with guided parameters"
+)
+def control_toy(
+    action: str, intensity: str = "10", duration: str = "5"
+) -> str:
+    return (
+        f"I want to control the Lovense toy with the following parameters:\n\n"
+        f"Action: {action}\n"
+        f"Intensity: {intensity}\n"
+        f"Duration: {duration} seconds\n\n"
+        f"Please execute this command using the appropriate tool."
+    )
+
+
+@mcp.prompt(description="Quick vibration with preset intensity and duration")
+def quick_vibrate(level: str = "medium") -> str:
+    intensity_map = {"low": 5, "medium": 10, "high": 18}
+    intensity = intensity_map.get(level, 10)
+    return (
+        f"Please send a quick vibration command with {level} intensity "
+        f"(level {intensity}) for 3 seconds."
+    )
+
+
+@mcp.prompt(description="Play a vibration pattern with specified duration")
+def pattern_play(pattern_name: str = "pulse", duration: str = "10") -> str:
+    return f"Please play the '{pattern_name}' vibration pattern for {duration} seconds."
+
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP transport with auth & Origin validation
+# (MCP spec 2025-11-25 §Transports)
+# ---------------------------------------------------------------------------
+
+
+class AuthOriginMiddleware:
+    """ASGI middleware that enforces Bearer-token auth and Origin validation.
+
+    - Skips auth for /health.
+    - If MCP_AUTH_TOKEN is unset, auth is disabled.
+    - If ALLOWED_ORIGINS is unset, Origin checking is disabled.
+    - Returns HTTP 403 for invalid Origin (per MCP spec).
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.auth_token = os.getenv("MCP_AUTH_TOKEN")
+        raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+        self.allowed_origins = (
+            [o.strip() for o in raw_origins.split(",") if o.strip()]
+            if raw_origins
+            else []
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path == "/health":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+
+        # Origin validation (MCP spec: MUST validate to prevent DNS rebinding)
+        origin = headers.get("origin", "")
+        if origin and self.allowed_origins and origin not in self.allowed_origins:
+            resp = Response("Forbidden: invalid origin", status_code=403)
+            await resp(scope, receive, send)
+            return
+
+        # Bearer token auth
+        if self.auth_token:
+            auth_header = headers.get("authorization", "")
+            token = (
+                auth_header.removeprefix("Bearer ").strip() if auth_header else ""
+            )
+            if not hmac.compare_digest(token, self.auth_token):
+                resp = Response("Unauthorized", status_code=401)
+                await resp(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+def create_streamable_http_app():
+    """Build an ASGI app that serves MCP over Streamable HTTP transport.
+
+    Uses FastMCP's built-in streamable_http_app which provides a single
+    MCP endpoint supporting POST (client messages) and GET (server SSE stream),
+    with session management via MCP-Session-Id headers.
+
+    A /health endpoint and auth/origin middleware are layered on top.
+    """
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    async def health(request: Request):
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "server": "lovense-mcp-server",
+                "version": "2.0.0",
+                "domain_configured": bool(config and config.domain_url),
+            }
+        )
+
+    # FastMCP provides the complete Streamable HTTP ASGI app
+    # (single endpoint with POST + GET + DELETE, session management, etc.)
+    mcp_app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with mcp.session_manager.run():
+            yield
+
+    app = Starlette(
+        routes=[
+            Route("/health", endpoint=health),
+            Mount("/", app=mcp_app),
+        ],
+        lifespan=lifespan,
+    )
+
+    return AuthOriginMiddleware(app)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import asyncio
+
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+    # Initialize Lovense connection
+    config = LovenseConfig()
+    api_client = LovenseAPIClient(config)
+
+    if transport == "stdio":
+        # stdio transport – launched as a subprocess by the MCP client
+        async def run_stdio():
+            async with api_client:
+                await mcp.run_stdio_async()
+
+        asyncio.run(run_stdio())
+    else:
+        # Streamable HTTP transport – standalone server (MCP spec 2025-11-25)
+        async def run_http():
+            async with api_client:
+                host = os.getenv("HOST", "127.0.0.1")
+                port = int(os.getenv("PORT", "8000"))
+                app = create_streamable_http_app()
+                server_config = uvicorn.Config(
+                    app, host=host, port=port, log_level="info"
+                )
+                server = uvicorn.Server(server_config)
+                await server.serve()
+
+        asyncio.run(run_http())
